@@ -1,9 +1,13 @@
-from google.cloud import storage
-from fastapi import UploadFile
-import aiofiles
-import os
-from config.settings import settings
+from __future__ import annotations
+
+import hashlib
 import logging
+from typing import Tuple
+
+from fastapi import UploadFile
+from google.cloud import storage
+
+from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
@@ -12,13 +16,15 @@ class GCSManager:
         self.client = storage.Client(project=settings.GCP_PROJECT_ID)
         self.bucket = self.client.bucket(settings.GCS_BUCKET_NAME)
 
-    async def upload_file(self, file: UploadFile, destination_path: str) -> str:
+    async def upload_file(self, file: UploadFile, destination_path: str) -> Tuple[str, str]:
         """Upload file to Google Cloud Storage"""
         try:
             blob = self.bucket.blob(destination_path)
 
             # Read file content
             content = await file.read()
+
+            file_hash = hashlib.sha256(content).hexdigest()
 
             # Upload to GCS
             blob.upload_from_string(content, content_type=file.content_type)
@@ -27,7 +33,7 @@ class GCSManager:
             # blob.make_public()
 
             logger.info(f"File uploaded to GCS: {destination_path}")
-            return f"gs://{settings.GCS_BUCKET_NAME}/{destination_path}"
+            return f"gs://{settings.GCS_BUCKET_NAME}/{destination_path}", file_hash
 
         except Exception as e:
             logger.error(f"GCS upload error: {str(e)}")

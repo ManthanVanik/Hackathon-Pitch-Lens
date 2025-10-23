@@ -12,3 +12,4 @@ python-docx
 PyPDF2
 pydantic-settings
 python-dotenv
+numpy

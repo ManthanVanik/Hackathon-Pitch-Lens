@@ -1,202 +1,244 @@
-import vertexai
-from vertexai.preview.generative_models import GenerativeModel
-from typing import Dict, Any
-import logging
-from config.settings import settings
+from __future__ import annotations
+
 import json
+import logging
 import re
+from typing import Any, Dict, List
+
+import vertexai
+from vertexai.preview.generative_models import GenerationConfig, GenerativeModel
+
+from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
+
 class GeminiSummarizer:
-    def __init__(self):
+    """Wrapper around Gemini with deterministic defaults and parsing helpers."""
+
+    def __init__(self) -> None:
         vertexai.init(project=settings.GCP_PROJECT_ID, location=settings.GCP_LOCATION)
         self.model = GenerativeModel("gemini-2.5-pro")
+        # Force deterministic behaviour so repeated uploads stay consistent.
+        self._generation_config = GenerationConfig(
+            temperature=0.0,
+            top_p=1.0,
+            top_k=1,
+        )
 
-    async def summarize_pitch_deck(self, full_text: str) -> Dict[str, str]:
-        """Summarize pitch deck into structured sections"""
+    def _generate_text(self, prompt: str) -> str:
+        response = self.model.generate_content(
+            prompt,
+            generation_config=self._generation_config,
+        )
+        text = getattr(response, "text", "")
+        return text.strip() if isinstance(text, str) else ""
+
+    def generate_text(self, prompt: str) -> str:
+        """Public wrapper for deterministic text generation."""
+        return self._generate_text(prompt)
+
+    @staticmethod
+    def _coerce_string_list(value: Any) -> List[str]:
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()]
+        if isinstance(value, str) and value.strip():
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError:
+                return [part.strip("-• \t") for part in value.splitlines() if part.strip("-• \t")]
+            return GeminiSummarizer._coerce_string_list(parsed)
+        return []
+
+    @staticmethod
+    def _dedupe_preserve_order(items: List[str]) -> List[str]:
+        seen = set()
+        deduped: List[str] = []
+        for item in items:
+            key = item.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(item)
+        return deduped
+
+    @staticmethod
+    def _strip_json_fences(payload: str) -> str:
+        return re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", payload, flags=re.MULTILINE).strip()
+
+    async def _legacy_summarize_pitch_deck(self, full_text: str) -> Dict[str, Any]:
+        summary_prompt = (
+            "Analyze the following pitch deck content and extract information for these sections:\n"
+            "- problem: What problem is being solved?\n"
+            "- solution: What is the proposed solution?\n"
+            "- market: Market size, opportunity, and target customers\n"
+            "- team: Information about the founding team and key personnel\n"
+            "- traction: Current progress, metrics, customers, revenue\n"
+            "- financials: Financial projections, funding requirements, revenue model\n\n"
+            "Pitch deck content:\n"
+            f"{full_text}\n\n"
+            "Return the analysis as a JSON object with the above keys. Be concise but comprehensive.\n"
+            'If a section is not clearly addressed in the pitch deck, indicate "Not specified" for that key.'
+        )
+
+        summary_text = self._generate_text(summary_prompt)
+
+        founder_prompt = (
+            "Analyze the following pitch deck content and extract list of founders in array:\n\n"
+            "Pitch deck content:\n"
+            f"{full_text}\n\n"
+            "Return the analysis as an array.\n"
+            "If no data found send empty array."
+        )
+
+        founder_raw = self._generate_text(founder_prompt)
+        founder_clean = self._strip_json_fences(founder_raw)
         try:
-            prompt = f"""
-            Analyze the following pitch deck content and extract information for these sections:
-            - problem: What problem is being solved?
-            - solution: What is the proposed solution?
-            - market: Market size, opportunity, and target customers
-            - team: Information about the founding team and key personnel
-            - traction: Current progress, metrics, customers, revenue
-            - financials: Financial projections, funding requirements, revenue model
+            founder_data = json.loads(founder_clean) if founder_clean else []
+        except json.JSONDecodeError:
+            founder_data = founder_clean
+        founder_response = self._dedupe_preserve_order(self._coerce_string_list(founder_data))
 
-            Pitch deck content:
-            {full_text}
+        sector_prompt = (
+            "Analyze the following pitch deck content and extract name of sector in which this startup fall in:\n\n"
+            "Pitch deck content:\n"
+            f"{full_text}\n\n"
+            "Return specific sector name only no extra word.\n"
+            'If no data found send empty string "".'
+        )
 
-            Return the analysis as a JSON object with the above keys. Be concise but comprehensive.
-            If a section is not clearly addressed in the pitch deck, indicate "Not specified" for that key.
-            """
+        sector_response = self._strip_json_fences(self._generate_text(sector_prompt))
 
-            response = self.model.generate_content(prompt)
-            # print("response: ",response.text)
-            
-            founder_prompt = f"""
-            Analyze the following pitch deck content and extract list of founders in array:
-            
-            
-            Pitch deck content:
-            {full_text}
+        company_name_prompt = (
+            "Analyze the following pitch deck content and extract name of the startup/company this pitch is for:\n\n"
+            "Pitch deck content:\n"
+            f"{full_text}\n\n"
+            "Return the organization or company name only with no extra words.\n"
+            'If no data found send empty string "".'
+        )
 
-            Return the analysis as an array.
-            If no data found send empty array.
-            """
+        company_name_response = self._strip_json_fences(self._generate_text(company_name_prompt))
 
-            founder_response_temp = self.model.generate_content(founder_prompt)
-            founder_response_temp = re.sub(r"^```json\s*|\s*```$", "", founder_response_temp.text.strip(), flags=re.MULTILINE)
+        product_name_prompt = (
+            "Analyze the following pitch deck content and extract the primary product or platform name the startup is promoting.\n\n"
+            "Pitch deck content:\n"
+            f"{full_text}\n\n"
+            'Return the product/solution name only with no extra words. If none is mentioned, return an empty string "".'
+        )
 
-            # Convert to Python list
-            founder_response = json.loads(founder_response_temp)
-            print("founder_response: ", founder_response)
-            # founder_response_temp = founder_response_temp.text[7:-3];
-            # founder_response = re.sub(r"^``````$", "", founder_response_temp.text.strip(), flags=re.IGNORECASE)
-            
-            sector_prompt = f"""
-            Analyze the following pitch deck content and extract name of sector in which this startup fall in:
-            
-            
-            Pitch deck content:
-            {full_text}
+        product_name_response = self._strip_json_fences(self._generate_text(product_name_prompt))
 
-            Return specific sector name only no extra word.
-            If no data found send empty string "".
-            """
+        return {
+            "summary_res": summary_text,
+            "founder_response": founder_response,
+            "sector_response": sector_response,
+            "company_name_response": company_name_response,
+            "product_name_response": product_name_response,
+        }
 
-            sector_response_temp = self.model.generate_content(sector_prompt)        
-            sector_response = re.sub(r"^``````$", "", sector_response_temp.text.strip(), flags=re.IGNORECASE)
-            
-            company_name_prompt = f"""
-            Analyze the following pitch deck content and extract name of the startup/company this pitch is for:
-            
-            
-            Pitch deck content:
-            {full_text}
+    async def summarize_pitch_deck(self, full_text: str) -> Dict[str, Any]:
+        """Summarize pitch deck into structured sections."""
+        try:
+            prompt = (
+                "You are processing a startup pitch deck. Read the content below and return a JSON object with the following keys:\n"
+                '- "summary": concise overall summary (string)\n'
+                '- "founders": array of founder names (strings only)\n'
+                '- "sector": specific industry or sector (string)\n'
+                '- "company_name": organization or legal company name (string)\n'
+                '- "product_name": primary product/solution or brand being pitched (string, may be empty)\n\n'
+                "Pitch deck content:\n"
+                f"{full_text}\n\n"
+                "Requirements:\n"
+                "- The JSON must be valid and parsable with standard libraries.\n"
+                '- If only a product or brand name is mentioned, put it in both "company_name" and "product_name".\n'
+                '- If both company and product are mentioned, ensure the company/legal entity goes in "company_name" and the flagship product/solution goes in "product_name".\n'
+                '- Trim whitespace from values and avoid commentary.\n'
+                '- When unsure, leave the value as an empty string "".'
+            )
 
-            Return specific name only no extra words.
-            If no data found send empty string "".
-            """
+            structured_raw = self._generate_text(prompt)
+            structured_clean = self._strip_json_fences(structured_raw)
 
-            company_name_response_temp = self.model.generate_content(company_name_prompt)
-            company_name_response = re.sub(r"^``````$", "", company_name_response_temp.text.strip(), flags=re.IGNORECASE)
-            
-            
-            # Try direct parse first
-#             try:
-#                 return json.loads(response.text.strip())
-            
-#             except json.JSONDecodeError:
-#                 pass
-            
-#             print("extract_json_block")
-            # Extract JSON block and parse
-            # block = self.extract_json_block(response.text.strip())
-            # if block:
-            #     try:
-            #         return json.loads(block)
-            #     except json.JSONDecodeError:
-            #         pass
-            # Parse JSON response
-#             try:
-#                 summary = json.loads(response.text.strip())
-#             except json.JSONDecodeError:
-#                 # Fallback parsing if JSON is malformed
-#                 summary = self._parse_fallback_summary(response.text)
+            try:
+                structured_payload: Dict[str, Any] = json.loads(structured_clean) if structured_clean else {}
+            except json.JSONDecodeError:
+                logger.warning("Failed to parse structured summary payload; falling back to legacy prompts")
+                return await self._legacy_summarize_pitch_deck(full_text)
 
-#             return summary
-            return {"summary_res": response.text,
-                   "founder_response": founder_response,
-                   "sector_response": sector_response,
-                   "company_name_response": company_name_response}
+            summary_text = str(structured_payload.get("summary", "")).strip()
+            founder_response = self._dedupe_preserve_order(
+                self._coerce_string_list(structured_payload.get("founders", []))
+            )
+            sector_response = str(structured_payload.get("sector", "")).strip()
+            company_name_response = str(structured_payload.get("company_name", "")).strip()
+            product_name_response = str(structured_payload.get("product_name", "")).strip()
 
-        except Exception as e:
-            logger.error(f"Pitch deck summarization error: {str(e)}")
+            if not summary_text:
+                summary_text = self._generate_text(
+                    "Provide a concise summary of the following pitch deck in under 160 words:\n"
+                    f"{full_text}"
+                )
+
+            return {
+                "summary_res": summary_text,
+                "founder_response": founder_response,
+                "sector_response": sector_response,
+                "company_name_response": company_name_response,
+                "product_name_response": product_name_response,
+            }
+
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.error("Pitch deck summarization error: %s", exc)
             return {
                 "problem": "Error in processing",
                 "solution": "Error in processing",
                 "market": "Error in processing",
                 "team": "Error in processing",
                 "traction": "Error in processing",
-                "financials": "Error in processing"
+                "financials": "Error in processing",
+                "founder_response": [],
+                "sector_response": "",
+                "company_name_response": "",
+                "product_name_response": "",
+                "summary_res": "",
             }
 
     async def summarize_audio_transcript(self, transcript: str) -> str:
-        """Summarize audio transcript"""
+        """Summarize audio transcript."""
         try:
-            prompt = f"""
-            Summarize the following pitch transcript into key points:
-            - Main value proposition
-            - Key business metrics mentioned
-            - Important insights about market or competition
-            - Notable quotes from the founder
+            prompt = (
+                "Summarize the following pitch transcript into key points:\n"
+                "- Main value proposition\n"
+                "- Key business metrics mentioned\n"
+                "- Important insights about market or competition\n"
+                "- Notable quotes from the founder\n\n"
+                "Transcript:\n"
+                f"{transcript}\n\n"
+                "Provide a concise summary in bullet points."
+            )
 
-            Transcript:
-            {transcript}
+            return self._generate_text(prompt)
 
-            Provide a concise summary in bullet points.
-            """
-
-            response = self.model.generate_content(prompt)
-            return response.text.strip()
-
-        except Exception as e:
-            logger.error(f"Audio summarization error: {str(e)}")
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.error("Audio summarization error: %s", exc)
             return "Error processing audio transcript"
 
-    async def generate_memo(self, deal_data: Dict[str, Any], weightage: dict) -> str:
-        """Generate complete investment memo"""
+    async def generate_memo(self, deal_data: Dict[str, Any], weightage: Dict[str, Any]) -> Dict[str, Any]:
+        """Generate complete investment memo."""
         try:
-            # Extract data
-            # print("deal data: ", deal_data)
-            metadata = deal_data.get('metadata', {})
-            extracted_text = deal_data.get('extracted_text', {})
-            public_data = deal_data.get('public_data', {})
-            user_input = deal_data.get('user_input', {})
-            print("Data Retriverd")
-            # Build context
+            metadata = deal_data.get("metadata", {})
+            extracted_text = deal_data.get("extracted_text", {})
+            public_data = deal_data.get("public_data", {})
+            user_input = deal_data.get("user_input", {})
+
             context = self._build_memo_context(metadata, extracted_text, public_data, user_input)
-            # print("context : ",context)
 
-#             prompt = f"""
-#             Generate a comprehensive investment memo based on the following information.
-
-#             {context}
-
-#             Structure the memo with these sections:
-#             1. Executive Summary
-#             2. Founder Profile & Market Fit
-#             3. Problem & Opportunity
-#             4. Unique Differentiator
-#             5. Team Execution Ability
-#             6. Market Benchmarks
-#             7. Risks & Red Flags
-#             8. Investment Recommendation
-
-#             Write in a professional, analytical tone suitable for investment committee review.
-#             Include specific data points and metrics where available.
-#             Provide a weighted scoring recommendation based on the weightages provided.
-#             """
-
-            # prompt = f""" Generate a structured investment memo in JSON format for the startup under review. Based on the following information 
-            #      {context} 
-            #      Generate an investment memo considering these weightages:
-            #      Team Strength: {weightage['team_strength']}%
-            #      Market Opportunity: {weightage['market_opportunity']}%
-            #      Traction: {weightage['traction']}%
-            #      Claim Credibility: {weightage['claim_credibility']}%
-            #      Financial Health: {weightage['financial_health']}%
-            #      from the provided data above extract all available information about the company, including its name, founders’ educational and professional details, previous ventures, sector focus, current market presence, technology stack, facilities, revenue model, pricing, unit economics, scalability, fundraising history, valuation rationale, financial metrics, risks, and mitigation strategies. Then, enrich this with data scraped from the internet to identify the company’s closest competitors, their business models, funding rounds, margins, and growth rates, as well as any latest news about the company itself. The analysis must also cover the broader industry trends, current market size, sub-segment opportunities, and growth forecasts relevant to the company’s sector. For every claim made by the company regarding revenue targets, market share, or growth potential, conduct a probabilistic verification using forecasting models. If the dataset available is only 6 to 12 months long, apply ETS or Bayesian log-linear regression; if 12 to 18 months, use ARIMA or Holt-Winters; if 18 months or longer, apply Prophet or Bayesian Structural Time Series. Run the chosen algorithm to simulate future trajectories and calculate the probability of the company achieving its stated goals. Incorporate Monte Carlo simulations where variability and uncertainty in assumptions must be captured. Construct a risk metric by combining financial metrics such as burn rate, runway, gross margins, ARR growth, customer acquisition cost, and LTV ratios with the credibility of claims validated through the probabilistic methods. The risk metric should output a percentage score representing the likelihood of safe investment versus potential downside. The predictions and risk metrics must be deterministic and stable across runs, always yielding the same result unless the input data itself changes. Present the final output in JSON format with the following structure: “company_overview” including name, sector, founders, and technology; “market_analysis” covering industry size, sub-segments, competitor details, and recent news; “business_model” describing revenue streams, pricing, and scalability; “financials” covering ARR, MRR, burn, runway, funding history, valuation rationale, and projections; “claims_analysis” where each claim is listed with the chosen algorithm, input dataset length, simulated probability, and result; “risk_metrics” providing the composite score and narrative justification; “conclusion” summarizing overall attractiveness of the opportunity. 
-            #      """
-            
             prompt = f"""
                 You are an investment analyst. Your task is to generate a structured investment memo for the startup under review.
 
                 Instructions:
-                1. The output MUST be in strict JSON format. Do not include text outside the JSON. 
-                2. Always follow the schema below exactly. Every key and subkey MUST appear, even if data is missing (use "Not available" or [] for empty). 
+                1. The output MUST be in strict JSON format. Do not include text outside the JSON.
+                2. Always follow the schema below exactly. Every key and subkey MUST appear, even if data is missing (use "Not available" or [] for empty).
                 3. The response must be deterministic and stable across runs — always yielding the same result unless the input data itself changes.
                 4. Use the provided company data first, then enrich with reliable internet sources about competitors, market size, and industry trends.
                 5. For probabilistic forecasting of company claims, follow these rules:
@@ -216,7 +258,6 @@ class GeminiSummarizer:
                 8. All financial projections, probabilities, and risk metrics must be deterministic and stable.
 
                 Schema to follow exactly:
-
                 {{
                   "company_overview": {{
                     "name": "string",
@@ -242,33 +283,39 @@ class GeminiSummarizer:
                       "serviceable_obtainable_market": {{
                         "name": "string",
                         "value": "string",
-                        "projection": "string",
                         "cagr": "string",
                         "source": "string"
                       }},
                       "commentary": "string"
                     }},
-                    "sub_segment_opportunities": ["string"],
-                    "competitor_details": [
-                      {{
-                        "name": "string",
-                        "category": "string",
-                        "business_model": "string",
-                        "funding": "string",
-                        "margins": "string",
-                        "commentary": "string"
-                      }}
-                    ],
-                    "recent_news": "string"
+                    "recent_news": "string",
+                    "competitor_details": [{{
+                      "name": "string",
+                      "business_model": "string",
+                      "funding": "string",
+                      "margins": "string",
+                      "commentary": "string",
+                      "category": "string"
+                    }}],
+                    "sub_segment_opportunities": ["string"]
                   }},
                   "business_model": {{
                     "revenue_streams": "string",
                     "pricing": "string",
-                    "unit_economics": "string",
-                    "scalability": "string"
+                    "scalability": "string",
+                    "unit_economics": {{
+                      "customer_lifetime_value_ltv": "string",
+                      "customer_acquisition_cost_cac": "string"
+                    }}
                   }},
                   "financials": {{
-                    "arr_mrr": {{
+                    "funding_history": "string",
+                    "projections": [{{
+                      "year": "string",
+                      "revenue": "string"
+                    }}],
+                    "valuation_rationale": "string",
+                    "srr_mrr": {{
                       "current_booked_arr": "string",
                       "current_mrr": "string"
                     }},
@@ -276,25 +323,18 @@ class GeminiSummarizer:
                       "funding_ask": "string",
                       "stated_runway": "string",
                       "implied_net_burn": "string"
-                    }},
-                    "funding_history": "string",
-                    "valuation_rationale": "string",
-                    "projections": [
-                      {{ "year": "string", "revenue": "string" }}
-                    ]
-                  }},
-                  "claims_analysis": [
-                    {{
-                      "claim": "string",
-                      "analysis_method": "string",
-                      "input_dataset_length": "string",
-                      "simulation_assumptions": "string or object",
-                      "simulated_probability": "string",
-                      "result": "string"
                     }}
-                  ],
+                  }},
+                  "claims_analysis": [{{
+                    "claim": "string",
+                    "analysis_method": "string",
+                    "input_dataset_length": "string",
+                    "simulated_probability": "string",
+                    "result": "string",
+                    "simulation_assumptions": {{"assumptions": "string"}}
+                  }}],
                   "risk_metrics": {{
-                    "composite_risk_score": "number",
+                    "composite_risk_score": 0,
                     "score_interpretation": "string",
                     "narrative_justification": "string"
                   }},
@@ -303,137 +343,77 @@ class GeminiSummarizer:
                   }}
                 }}
 
-                Startup data:
+                Weighting preferences:
+                {weightage}
+
+                Source information:
                 {context}
+            """
 
-                Weightages:
-                Team Strength: {weightage['team_strength']}%
-                Market Opportunity: {weightage['market_opportunity']}%
-                Traction: {weightage['traction']}%
-                Claim Credibility: {weightage['claim_credibility']}%
-                Financial Health: {weightage['financial_health']}%
-                """
+            raw_response = self._generate_text(prompt)
+            clean = re.sub(r"^```json\s*|\s*```$", "", raw_response, flags=re.MULTILINE).strip()
+            try:
+                return json.loads(clean) if clean else {}
+            except json.JSONDecodeError:
+                logger.warning("Gemini memo response was not valid JSON; storing raw payload under 'raw_text'")
+                return {"raw_text": clean}
 
-            response_temp = self.model.generate_content(prompt)
-            # response = re.sub(r"^``````$", "", response_temp.text.strip(), flags=re.IGNORECASE)
-            clean_json_text = response_temp.text.strip()  # Remove leading/trailing whitespace
-            # print("Memo Response: ", clean_json_text)
-            
-#             if clean_json_text.startswith("'''json"):
-#                 print("Remove called")
-#                 clean_json_text = clean_json_text[len("'''json"):].strip()
-#                 print("Removed '''json : ", clean_json_text)
-#             if clean_json_text.endswith("'''"):
-#                 clean_json_text = clean_json_text[:-3].strip()
-            # clean_json_text = clean_json_text.removeprefix(r"'''json").removesuffix(r"'''").strip()
-            clean_json_text = clean_json_text[7:-3];
-            print("Cleaned :",clean_json_text);
-        
-            response = json.loads(clean_json_text)
-            # print("memo response: ",response)
-            # return response.text.strip()
-            return response
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.error("Memo generation error: %s", exc)
+            return {"error": "Error generating memo"}
 
-        except Exception as e:
-            logger.error(f"Memo generation error: {str(e)}")
-            return "Error generating investment memo"
+    def _build_memo_context(
+        self,
+        metadata: Dict[str, Any],
+        extracted_text: Dict[str, Any],
+        public_data: Dict[str, Any],
+        user_input: Dict[str, Any],
+    ) -> str:
+        """Build context string for memo generation."""
 
-    def _build_memo_context(self, metadata: Dict, extracted_text: Dict, 
-                           public_data: Dict, user_input: Dict) -> str:
-        """Build context string for memo generation"""
-        context_parts = []
+        context_parts: List[str] = []
 
         # Company information
         context_parts.append(f"Company: {metadata.get('company_name', 'N/A')}")
-        context_parts.append(f"Founder: {metadata.get('founder_name', 'N/A')}")
+        context_parts.append(f"Founders: {', '.join(metadata.get('founder_names', [])) or 'N/A'}")
         context_parts.append(f"Sector: {metadata.get('sector', 'N/A')}")
 
         # Pitch deck insights
-        if 'pitch_deck' in extracted_text and 'concise' in extracted_text['pitch_deck']:
-            deck_summary = extracted_text['pitch_deck']['concise']
-            context_parts.append("Pitch Deck Analysis:")
-            context_parts.append(deck_summary)
-            # for key, value in deck_summary.items():
-            #     context_parts.append(f"{key.title()}: {value}")
+        pitch_deck = extracted_text.get("pitch_deck") if isinstance(extracted_text, dict) else None
+        if isinstance(pitch_deck, dict):
+            concise = pitch_deck.get("concise")
+            if concise:
+                context_parts.append("Pitch Deck Analysis:")
+                context_parts.append(str(concise))
 
-        # Audio/video insights
-        for media_type in ['voice_pitch', 'video_pitch']:
-            if media_type in extracted_text:
-                media_summary = extracted_text[media_type].get('concise', {}).get('summary', '')
-                if media_summary:
+        # Media summaries
+        for media_type in ("voice_pitch", "video_pitch"):
+            media_data = extracted_text.get(media_type) if isinstance(extracted_text, dict) else None
+            if isinstance(media_data, dict):
+                summary = media_data.get("concise", {}).get("summary")
+                if summary:
                     context_parts.append(f"{media_type.replace('_', ' ').title()} Summary:")
-                    context_parts.append(media_summary)
+                    context_parts.append(str(summary))
 
         # Public data
-        if public_data:
+        if isinstance(public_data, dict) and public_data:
             context_parts.append("Public Information:")
             for key, value in public_data.items():
                 if isinstance(value, list):
-                    context_parts.append(f"{key.replace('_', ' ').title()}: {', '.join(value)}")
+                    context_parts.append(f"{key.replace('_', ' ').title()}: {', '.join(map(str, value))}")
                 else:
                     context_parts.append(f"{key.replace('_', ' ').title()}: {value}")
 
-        # User input
-        if user_input:
-            if 'qna' in user_input:
+        # User input (Q&A / weightages)
+        if isinstance(user_input, dict) and user_input:
+            qna = user_input.get("qna")
+            if isinstance(qna, dict):
                 context_parts.append("Additional Q&A:")
-                for q, a in user_input['qna'].items():
-                    context_parts.append(f"Q: {q}")
-                    context_parts.append(f"A: {a}")
+                for question, answer in qna.items():
+                    context_parts.append(f"Q: {question}")
+                    context_parts.append(f"A: {answer}")
 
-            if 'weightages' in user_input:
+            if "weightages" in user_input:
                 context_parts.append(f"Evaluation Weightages: {user_input['weightages']}")
 
-        return "".join(context_parts)
-
-    def _parse_fallback_summary(self, text: str) -> Dict[str, str]:
-        """Fallback parser if JSON parsing fails"""
-        sections = {
-            "problem": "Not specified",
-            "solution": "Not specified", 
-            "market": "Not specified",
-            "team": "Not specified",
-            "traction": "Not specified",
-            "financials": "Not specified"
-        }
-
-        # Simple text parsing logic
-        lines = text.split('')
-        current_key = None
-
-        for line in lines:
-            line = line.strip()
-            if ':' in line:
-                for key in sections.keys():
-                    if key.lower() in line.lower():
-                        current_key = key
-                        sections[key] = line.split(':', 1)[1].strip()
-                        break
-            elif current_key and line:
-                sections[current_key] += f" {line}"
-
-        return sections
-
-    def extract_json_block(s: str) -> str | None:
-        # Remove common markdown fences
-        s = s.strip()
-        s = re.sub(r"^``````$", "", s, flags=re.IGNORECASE | re.DOTALL).strip()
-
-        # Find first top-level JSON object or array
-        start_idx = None
-        brace_stack = []
-        for i, ch in enumerate(s):
-            if ch in "{[":
-                if start_idx is None:
-                    start_idx = i
-                brace_stack.append(ch)
-            elif ch in "}]":
-                if not brace_stack:
-                    continue
-                open_ch = brace_stack.pop()
-                if (open_ch, ch) not in {("{", "}"), ("[", "]")}:
-                    # mismatched; keep scanning
-                    continue
-                if not brace_stack and start_idx is not None:
-                    return s[start_idx:i+1]
-        return None
+        return "\n".join(context_parts)
